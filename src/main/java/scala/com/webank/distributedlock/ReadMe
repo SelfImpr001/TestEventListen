@@ -1,0 +1,44 @@
+- 在zookeeper指定节点（locks）下创建临时顺序节点node_n
+- 获取locks下所有子节点children
+- 对子节点按节点自增序号从小到大排序
+- 判断本节点是不是第一个子节点，若是，则获取锁；若不是，则监听比该节点小的那个节点的删除事件
+- 若监听事件生效，则回到第二步重新进行判断，直到获取到锁
+
+### 下面就具体使用java和zookeeper实现分布式锁，操作zookeeper使用的是apache提供的zookeeper的包。
+https://my.oschina.net/zupengliu/blog/1808874
+
+- 通过实现Watch接口，实现process(WatchedEvent event)方法来实施监控，使CountDownLatch来完成监控，在等待锁的时候使用CountDownLatch来计数，等到后进行countDown，停止等待，继续运行。
+- 以下整体流程基本与上述描述流程一致，只是在监听的时候使用的是CountDownLatch来监听前一个节点。
+
+### zookeeper 数据同步
+https://www.cnblogs.com/hadoop-dev/p/5946870.html
+
+如果一台zookeeper服务器成为集群中的leader,那么一定是当前所有服务器中保存数据最多的服务器,所以在这台服务器成为leader之后,首先要做的事情就是与集群中的其它服务器(现在是follower)同步数据,保证大家的数据一致,这个过程完毕了才开始正式处理来自客户端的连接请求.
+
+首先来看Leader做的工作:
+二)中提到的同步数据时使用的逻辑时钟,它的初始值是0,每次选举过程都会递增的,在leader正式上任之后做的第一件事情,就是根据当前保存的数据id值,设置最新的逻辑时钟值:
+
+long epoch = self.getLastLoggedZxid() >> 32L;
+            epoch++;
+            zk.setZxid(epoch << 32L);
+(函数Leader::lead()中)
+
+随后,leader构建NEWLEADER封包,该封包的数据是当前最大数据的id,广播给所有的follower,也就是告知follower leader保存的数据id是多少,大家看看是不是需要同步.
+然后,leader根据follower数量给每个follower创建一个线程LearnerHandler,专门负责接收它们的同步数据请求.
+leader主线程开始阻塞在这里,等待其他follower的回应(也就是LearnerHandler线程的处理结果),同样的,只有在超过半数的follower已经同步数据完毕,这个过程才能结束,leader才能正式成为leader.
+
+所以其实leader与follower同步数据的大部分操作都在LearnerHandler线程中处理的,接着看这一块.
+1) 如果数据完全一致,则发送DIFF封包告知follower当前数据就是最新的了.
+2) 判断这一阶段之内有没有已经被提交的提议值,如果有,那么:
+a) 如果有部分数据没有同步,那么会发送DIFF封包将有差异的数据同步过去.同时将follower没有的数据逐个发送COMMIT封包给follower要求记录下来.
+b) 如果follower数据id更大,那么会发送TRUNC封包告知截除多余数据.
+3) 如果这一阶段内没有提交的提议值,直接发送SNAP封包将快照同步发送给follower.
+以上消息完毕之后,发送UPTODATE封包告知follower当前数据就是最新的了,再次发送NEWLEADER封包宣称自己是leader,等待follower的响应.
+
+其次来看follower做的工作,follower与leader同步数据的操作在函数Follower::followLeader中进行.
+首先会尝试与leader建立连接,这里有一个机制,如果一定时间内没有连接上,就报错退出,重新回到选举状态.
+其次在函数learner::registerWithLeader中发送FOLLOWERINFO封包,该封包中带上自己的最大数据id,也就是会告知leader本机保存的最大数据id.
+最后,根据前面对LeaderHandler的分析,leader会根据不同的情况发送DIFF,UPTODATE,TRUNC,SNAP,依次进行处理就是了,此时follower跟leader的数据也就同步上了.
+由于leader端发送的最后一个封包是UPTODATE,因此在接收到这个封包之后follower结束同步数据过程,发送ACK封包回复leader.
+
+以上过程中,任何情况出现的错误,服务器将自动将选举状态切换到LOOKING状态,重新开始进行选举.
